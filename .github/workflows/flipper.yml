@@ -5,7 +5,9 @@ name: GE Flipper
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay runs a few minutes)
+    # Every 10 min, roughly 7am-9pm Eastern (UTC hours cover both EDT and EST).
+    # The scan step below trims this to exactly 8am-8pm Eastern.
+    - cron: "*/10 0-1,11-23 * * *"
   workflow_dispatch:          # lets you tap "Run workflow" to test it
 
 concurrency:
@@ -43,6 +45,11 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
+          HOUR=$(TZ=America/New_York date +%-H)
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$HOUR" -lt 8 ] || [ "$HOUR" -ge 20 ]; }; then
+            echo "Outside 8am-8pm Eastern ($HOUR:00). Skipping scan."
+            exit 0
+          fi
           python ge_flipper.py --once \
             --budget "${{ vars.BUDGET || '10000000' }}" \
             --alert-profit "${{ vars.ALERT_PROFIT || '250000' }}"
