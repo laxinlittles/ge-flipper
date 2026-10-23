@@ -5,19 +5,20 @@ name: GE Flipper
 
 on:
   schedule:
-    # Every 10 min, roughly 7am-9pm Eastern (UTC hours cover both EDT and EST).
-    # The scan step below trims this to exactly 8am-8pm Eastern.
-    - cron: "*/10 0-1,11-23 * * *"
+    # Hourly starts, roughly 7am-9pm Eastern (UTC hours cover both EDT and EST).
+    # A run stays on and scans every 2 min until 8pm Eastern, so a late or
+    # skipped start by GitHub doesn't leave gaps. Extra starts wait in line.
+    - cron: "3 0,11-23 * * *"
   workflow_dispatch:          # lets you tap "Run workflow" to test it
 
 concurrency:
   group: ge-flipper
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -44,15 +45,26 @@ jobs:
       - name: Scan the GE
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          BUDGET: ${{ vars.BUDGET || '10000000' }}
+          ALERT_PROFIT: ${{ vars.ALERT_PROFIT || '250000' }}
         run: |
+          ARGS="--budget $BUDGET --alert-profit $ALERT_PROFIT"
           HOUR=$(TZ=America/New_York date +%-H)
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$HOUR" -lt 8 ] || [ "$HOUR" -ge 20 ]; }; then
-            echo "Outside 8am-8pm Eastern ($HOUR:00). Skipping scan."
+          if [ "$HOUR" -lt 8 ] || [ "$HOUR" -ge 20 ]; then
+            if [ "${{ github.event_name }}" != "schedule" ]; then
+              echo "Manual run outside 8am-8pm: one scan only."
+              python -u ge_flipper.py --once $ARGS
+            else
+              echo "Outside 8am-8pm Eastern ($HOUR:00). Skipping scan."
+            fi
             exit 0
           fi
-          python ge_flipper.py --once \
-            --budget "${{ vars.BUDGET || '10000000' }}" \
-            --alert-profit "${{ vars.ALERT_PROFIT || '250000' }}"
+          # Scan every 2 min until 8pm Eastern (max ~5h45m per run).
+          END=$(TZ=America/New_York date -d "today 20:00" +%s)
+          SECS=$(( END - $(date +%s) ))
+          [ "$SECS" -gt 20700 ] && SECS=20700
+          echo "Scanning every 2 min for $((SECS / 60)) minutes."
+          timeout "$SECS" python -u ge_flipper.py --interval 120 $ARGS || true
 
       - uses: actions/cache/save@v4
         if: always()
