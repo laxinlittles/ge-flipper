@@ -175,12 +175,98 @@ def print_table(rows, cfg):
               f"{r['roi']:>6.1f}%{gp(r['hourly_vol']):>8}")
 
 
-def alert_text(r):
-    return (f"{r['name']}\n"
+# --------------------------------------------------------------------------- #
+# Price-history risk check (runs only on alert candidates)
+# --------------------------------------------------------------------------- #
+_risk_cache = {}   # item id -> (checked_at, result); avoids re-fetching every scan
+
+
+def fetch_series(item_id, step):
+    r = requests.get(f"{API}/timeseries", params={"id": item_id, "timestep": step},
+                     headers={"User-Agent": USER_AGENT}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _slope_pct(values):
+    """Least-squares trend across the series, as % change from start to end."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mx, my = (n - 1) / 2, sum(values) / n
+    num = sum((i - mx) * (v - my) for i, v in enumerate(values))
+    den = sum((i - mx) ** 2 for i in range(n))
+    return (num / den) * (n - 1) / my * 100 if my else 0.0
+
+
+def assess_risk(r, cfg, hourly=None, six_hourly=None):
+    """
+    Checks whether price history supports this flip. Returns
+    {"ok": bool, "reasons": [failed checks], "summary": str}.
+
+    1. Below-buy risk: share of the last 48 hours where the average sell-side
+       price (what buyers paid) was BELOW your buy price. If that happens often,
+       you could get stuck holding items worth less than you paid.
+    2. Trend: 24h price trend. A falling market makes a drop below buy likely.
+    3. Spike: your buy price vs the 7-day median. Buying into a spike risks
+       the price falling back below what you paid.
+    4. Margin held: share of the last 24 hours the after-tax margin was positive.
+       A margin that only just appeared often vanishes before you can sell.
+    """
+    item_id = r["id"]
+    if hourly is None:
+        hourly = fetch_series(item_id, "1h")
+    if six_hourly is None:
+        six_hourly = fetch_series(item_id, "6h")
+
+    h48 = [p for p in hourly[-48:] if p.get("avgHighPrice")]
+    h24 = [p for p in hourly[-24:] if p.get("avgHighPrice") and p.get("avgLowPrice")]
+    lows7d = [p["avgLowPrice"] for p in six_hourly[-28:] if p.get("avgLowPrice")]
+
+    if len(h48) < 12 or len(h24) < 8 or len(lows7d) < 8:
+        return {"ok": False, "reasons": ["not enough price history"],
+                "summary": "Not enough trade history to judge risk"}
+
+    buy = r["buy"]
+    below = sum(1 for p in h48 if p["avgHighPrice"] < buy) / len(h48)
+    mids = [(p["avgHighPrice"] + p["avgLowPrice"]) / 2 for p in h24]
+    trend = _slope_pct(mids)
+    spike = (buy / _median(lows7d) - 1) * 100
+    held = sum(1 for p in h24
+               if p["avgHighPrice"] - ge_tax(p["avgHighPrice"], item_id, cfg.tax)
+               - p["avgLowPrice"] > 0) / len(h24)
+
+    reasons = []
+    if below > cfg.max_drop_risk:
+        reasons.append(f"price fell below buy in {below:.0%} of last 48h")
+    if trend < -cfg.max_downtrend:
+        reasons.append(f"24h downtrend {trend:+.1f}%")
+    if spike > cfg.max_spike:
+        reasons.append(f"buy price {spike:+.1f}% above 7-day median")
+    if held < cfg.min_margin_held:
+        reasons.append(f"margin only held {held:.0%} of last 24h")
+
+    summary = (f"Below-buy risk: {below:.0%} of last 48h\n"
+               f"24h trend: {trend:+.1f}% | vs 7d median: {spike:+.1f}%\n"
+               f"Margin held: {held:.0%} of last 24h")
+    return {"ok": not reasons, "reasons": reasons, "summary": summary}
+
+
+def alert_text(r, risk=None):
+    text = (f"{r['name']}\n"
             f"Buy at {r['buy']:,} | Sell at {r['sell']:,}\n"
             f"Qty: {r['qty']:,} (cost {gp(r['cost'])})\n"
             f"Tax: {r['tax']:,}/ea | Profit: {r['profit_each']:,}/ea\n"
             f"Total profit after tax: {r['total_profit']:,} gp ({r['roi']:.1f}% ROI)")
+    if risk:
+        text += "\n" + risk["summary"]
+    return text
 
 
 def send_alerts(rows, cfg, history):
@@ -191,7 +277,24 @@ def send_alerts(rows, cfg, history):
         last = history.get(str(r["id"]), 0)
         if now - last < cfg.cooldown * 60:
             continue   # already alerted on this item recently
-        msg = alert_text(r)
+
+        risk = None
+        if not cfg.no_risk_check:
+            cached = _risk_cache.get(r["id"])
+            if cached and now - cached[0] < 30 * 60 and not cached[1]["ok"]:
+                continue   # failed recently; recheck in 30 min
+            try:
+                risk = assess_risk(r, cfg)
+            except requests.RequestException as e:
+                print(f"  (history check failed for {r['name']}: {e}; skipping alert)")
+                continue
+            _risk_cache[r["id"]] = (now, risk)
+            if not risk["ok"]:
+                print(f"  Skipped {r['name']} ({gp(r['total_profit'])}): "
+                      + "; ".join(risk["reasons"]))
+                continue
+
+        msg = alert_text(r, risk)
         print(f"\n🔔 ALERT\n{msg}")
 
         if cfg.ntfy:
@@ -247,6 +350,13 @@ def parse_args():
     a.add_argument("--top", type=int, default=15, help="How many flips to show")
     a.add_argument("--interval", type=int, default=120, help="Seconds between scans")
     a.add_argument("--cooldown", type=int, default=60, help="Minutes before re-alerting the same item")
+    a.add_argument("--max-drop-risk", type=float, default=0.10,
+                   help="Max share of last 48h the price sat below your buy price (0.10 = 10%%)")
+    a.add_argument("--max-downtrend", type=float, default=3.0, help="Max 24h price drop %% allowed")
+    a.add_argument("--max-spike", type=float, default=8.0, help="Max %% your buy can sit above the 7-day median")
+    a.add_argument("--min-margin-held", type=float, default=0.60,
+                   help="Min share of last 24h the after-tax margin was positive")
+    a.add_argument("--no-risk-check", action="store_true", help="Alert without the price-history check")
     a.add_argument("--f2p", action="store_true", help="Free-to-play items only")
     a.add_argument("--once", action="store_true", help="Scan once and exit")
     a.add_argument("--ntfy", default=os.getenv("NTFY_TOPIC"), help="ntfy.sh topic for phone push alerts")
