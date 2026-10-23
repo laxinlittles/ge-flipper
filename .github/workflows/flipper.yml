@@ -1,0 +1,54 @@
+# GE Flipper - runs ge_flipper.py on GitHub's servers and pushes flips to ntfy.
+# Save this file in your repo at:  .github/workflows/flipper.yml
+
+name: GE Flipper
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay runs a few minutes)
+  workflow_dispatch:          # lets you tap "Run workflow" to test it
+
+concurrency:
+  group: ge-flipper
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      # Remembers which items already alerted, so you aren't spammed every run.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ge_alert_history.json
+          key: alert-history-${{ github.run_id }}
+          restore-keys: alert-history-
+
+      - name: Test notification (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          curl -s -H "Title: GE Flipper connected" -H "Tags: white_check_mark" \
+            -d "Your flipper is running on GitHub. Real alerts will look like a flip with buy/sell/qty/profit." \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+
+      - name: Scan the GE
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python ge_flipper.py --once \
+            --budget "${{ vars.BUDGET || '10000000' }}" \
+            --alert-profit "${{ vars.ALERT_PROFIT || '250000' }}"
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ge_alert_history.json
+          key: alert-history-${{ github.run_id }}
