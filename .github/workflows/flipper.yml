@@ -1,19 +1,29 @@
 # GE Flipper - runs ge_flipper.py on GitHub's servers and pushes flips to ntfy.
 # Save this file in your repo at:  .github/workflows/flipper.yml
+#
+# How it stays on: each run scans (8am-8pm Eastern) or waits (overnight) for up
+# to ~5h40m, then starts the next run itself. GitHub's timer is only a backup
+# that restarts the chain if it ever breaks.
 
 name: GE Flipper
 
 on:
   schedule:
-    # Hourly starts, roughly 7am-9pm Eastern (UTC hours cover both EDT and EST).
-    # A run stays on and scans every 2 min until 8pm Eastern, so a late or
-    # skipped start by GitHub doesn't leave gaps. Extra starts wait in line.
-    - cron: "3 0,11-23 * * *"
-  workflow_dispatch:          # lets you tap "Run workflow" to test it
+    - cron: "17 */3 * * *"    # backup restart every 3 hours
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: "Started by the previous run (leave unchecked)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ge-flipper
   cancel-in-progress: false
+
+permissions:
+  actions: write      # lets a run start the next one
+  contents: read
 
 jobs:
   scan:
@@ -36,7 +46,7 @@ jobs:
           restore-keys: alert-history-
 
       - name: Test notification (manual runs only)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.chain
         run: |
           curl -s -H "Title: GE Flipper connected" -H "Tags: white_check_mark" \
             -d "Your flipper is running on GitHub. Real alerts will look like a flip with buy/sell/qty/profit." \
@@ -47,27 +57,40 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           BUDGET: ${{ vars.BUDGET || '10000000' }}
           ALERT_PROFIT: ${{ vars.ALERT_PROFIT || '250000' }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' && !inputs.chain }}
         run: |
           ARGS="--budget $BUDGET --alert-profit $ALERT_PROFIT"
-          HOUR=$(TZ=America/New_York date +%-H)
-          if [ "$HOUR" -lt 8 ] || [ "$HOUR" -ge 20 ]; then
-            if [ "${{ github.event_name }}" != "schedule" ]; then
+          ET() { TZ=America/New_York date "$@"; }
+          NOW=$(date +%s)
+          CAP=$(( NOW + 20400 ))   # stay under GitHub's 6-hour job limit
+          HOUR=$(ET +%-H)
+          if [ "$HOUR" -ge 8 ] && [ "$HOUR" -lt 20 ]; then
+            END=$(ET -d "today 20:00" +%s)
+            [ "$END" -gt "$CAP" ] && END=$CAP
+            echo "Scanning every 2 min until $(ET -d @$END +%H:%M) Eastern."
+            timeout $(( END - NOW )) python -u ge_flipper.py --interval 120 $ARGS || true
+          else
+            if [ "$MANUAL" = "true" ]; then
               echo "Manual run outside 8am-8pm: one scan only."
               python -u ge_flipper.py --once $ARGS
-            else
-              echo "Outside 8am-8pm Eastern ($HOUR:00). Skipping scan."
             fi
-            exit 0
+            if [ "$HOUR" -lt 8 ]; then WAKE=$(ET -d "today 08:00" +%s)
+            else WAKE=$(ET -d "tomorrow 08:00" +%s); fi
+            [ "$WAKE" -gt "$CAP" ] && WAKE=$CAP
+            WAIT=$(( WAKE - $(date +%s) ))
+            [ "$WAIT" -lt 0 ] && WAIT=0
+            echo "Outside 8am-8pm Eastern. Waiting until $(ET -d @$WAKE +%H:%M) Eastern."
+            sleep "$WAIT"
           fi
-          # Scan every 2 min until 8pm Eastern (max ~5h45m per run).
-          END=$(TZ=America/New_York date -d "today 20:00" +%s)
-          SECS=$(( END - $(date +%s) ))
-          [ "$SECS" -gt 20700 ] && SECS=20700
-          echo "Scanning every 2 min for $((SECS / 60)) minutes."
-          timeout "$SECS" python -u ge_flipper.py --interval 120 $ARGS || true
 
       - uses: actions/cache/save@v4
         if: always()
         with:
           path: ge_alert_history.json
           key: alert-history-${{ github.run_id }}
+
+      - name: Start the next run
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run flipper.yml -R "${{ github.repository }}" --ref main -f chain=true
